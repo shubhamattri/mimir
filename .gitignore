@@ -1,0 +1,17 @@
+# Data (never commit personal data)
+data/raw/
+data/cleaned/
+
+# Environment
+.env
+
+# Backups
+backups/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
