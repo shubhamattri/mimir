@@ -29,11 +29,30 @@ CLEAN_DIR = PROJECT_DIR / "data" / "cleaned" / "whatsapp"
 QUARANTINE_DIR = PROJECT_DIR / "data" / "quarantined" / "whatsapp"
 
 OLLAMA_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-CLASSIFIER_MODEL = os.environ.get("CLASSIFIER_MODEL", "llama3.2")
+CLASSIFIER_MODEL = os.environ.get("CLASSIFIER_MODEL", "qwen3:8b")
 
 # Batch size for AI classification (trade-off: speed vs accuracy)
-# Higher = faster (fewer API calls) but less accurate per-message
-AI_BATCH_SIZE = 5
+# Higher = faster (fewer API calls) but slightly less accurate per-message
+AI_BATCH_SIZE = 50
+
+# Max chars sent to AI per message (full msg not needed for tone detection)
+AI_TRUNCATE_LEN = 120
+
+# Messages this short with no NSFW signals are obviously safe — skip AI
+OBVIOUS_SAFE_MAX_LEN = 40
+OBVIOUS_SAFE_RE = re.compile(
+    r"^("
+    r"ok[ay]*|yes|no|yeah|yep|nope|nah|haan|nahi|ha|hmm+|haha+|lol|lmao"
+    r"|done|coming|ok done|accha|theek hai|sahi hai|chal|chalo|acha"
+    r"|good morning|good night|gm|gn|thanks|thank you|ty|thx|shukriya"
+    r"|hello|hi|hey|bye|see you|ttyl|brb|k|kk|ohh*|ah+|nice|cool|great"
+    r"|what|when|where|why|how|who|kya|kab|kaha|kaise|kaun"
+    r"|send|sent|check|done|noted|sure|definitely|absolutely|got it"
+    r"|on my way|omw|reaching|reached|left|leaving|coming in \d+"
+    r"|one sec|wait|hold on|ruk|ek min|2 min|5 min|\d+ min"
+    r")$",
+    re.IGNORECASE,
+)
 
 # Your name(s) as they appear in WhatsApp exports
 YOUR_NAMES = {
@@ -125,54 +144,45 @@ MSG_RE = re.compile(
 # PASS 2: LOCAL AI CLASSIFIER
 # =============================================================================
 
-CLASSIFIER_PROMPT = """You are a content safety classifier. Your job is to determine if messages are SAFE for a professional AI knowledge base.
+CLASSIFIER_SYSTEM_PROMPT = """You are an AGGRESSIVE content safety filter. Your job: classify messages for a PROFESSIONAL knowledge base.
 
-Mark as UNSAFE (reply "UNSAFE") if the message contains ANY of:
-- Sexual, romantic, or intimate content (explicit OR implied)
-- Flirting, pet names, romantic affection (baby, jaan, babu, shona, etc.)
-- Innuendo or suggestive language in ANY language (English, Hindi, Hinglish, Punjabi, or mixed)
-- Personal relationship drama, fights between couples, emotional manipulation
-- Anything you wouldn't want a colleague or interviewer to read
+Mark UNSAFE if the message has ANY of: romantic language, pet names (baby/jaan/jaanu/babu/shona/darling/honey), sexual content, flirting, innuendo, intimate requests, missing someone romantically, couple fights, emotional manipulation. Works across English, Hindi, Hinglish, Punjabi.
 
-Mark as SAFE (reply "SAFE") if the message is:
-- Opinions, thoughts, analysis, decision-making
-- Work discussion, tech talk, general knowledge
-- Casual conversation about daily life (food, travel, plans, news)
-- Humor that isn't sexual
-- General greetings and logistics ("reaching in 10 min", "order food", etc.)
+Mark SAFE only if the message is clearly: work talk, tech, opinions, food/travel logistics, news, general greetings to friends/family (bhai/yaar/dude).
 
-BE AGGRESSIVE — when in doubt, mark UNSAFE. Losing a safe message is fine. Leaking an unsafe one is not.
-
-For each message below, reply with ONLY "SAFE" or "UNSAFE" on its own line, one per message. Nothing else.
-
-Messages:
-"""
+WHEN IN DOUBT → UNSAFE. Reply ONLY one word per line: SAFE or UNSAFE. No explanations."""
 
 
 def classify_with_ollama(messages: list[str]) -> list[bool]:
-    """Classify messages as safe/unsafe using local Ollama.
+    """Classify messages as safe/unsafe using local Ollama chat API.
 
+    Uses chat endpoint with think:false (required for Qwen3 thinking models).
     Returns list of bools: True = safe, False = unsafe.
     """
     if not messages:
         return []
 
-    # Build prompt with numbered messages
-    numbered = "\n".join(f"{i+1}. {msg}" for i, msg in enumerate(messages))
-    prompt = CLASSIFIER_PROMPT + numbered
+    # Build numbered message list (truncated — full text not needed for tone detection)
+    numbered = "\n".join(
+        f"{i+1}. {msg[:AI_TRUNCATE_LEN]}" for i, msg in enumerate(messages)
+    )
 
     payload = json.dumps({
         "model": CLASSIFIER_MODEL,
-        "prompt": prompt,
+        "messages": [
+            {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
+            {"role": "user", "content": numbered},
+        ],
         "stream": False,
+        "think": False,  # Disable thinking mode (critical for Qwen3)
         "options": {
-            "temperature": 0.0,  # Deterministic
-            "num_predict": len(messages) * 10,  # ~10 tokens per response line
+            "temperature": 0.0,
+            "num_predict": len(messages) * 10,
         }
     }).encode("utf-8")
 
     req = urllib.request.Request(
-        f"{OLLAMA_URL}/api/generate",
+        f"{OLLAMA_URL}/api/chat",
         data=payload,
         headers={"Content-Type": "application/json"},
     )
@@ -180,7 +190,9 @@ def classify_with_ollama(messages: list[str]) -> list[bool]:
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read())
-            response_text = result.get("response", "")
+            # Chat API returns message.content, generate API returns response
+            msg = result.get("message", {})
+            response_text = msg.get("content", "") or result.get("response", "")
     except (urllib.error.URLError, TimeoutError) as e:
         print(f"    WARNING: Ollama classification failed ({e}). Marking batch as UNSAFE for safety.")
         return [False] * len(messages)
@@ -357,9 +369,22 @@ def main():
             pass2_killed = 0
             quarantined = []
 
-            # Process in batches
-            for i in range(0, len(pass1_safe), AI_BATCH_SIZE):
-                batch = pass1_safe[i:i + AI_BATCH_SIZE]
+            # Pre-filter: skip AI for obviously safe short messages
+            needs_ai = []
+            obvious_safe_count = 0
+            for msg in pass1_safe:
+                stripped = msg.strip()
+                if len(stripped) <= OBVIOUS_SAFE_MAX_LEN and OBVIOUS_SAFE_RE.match(stripped):
+                    pass2_safe.append(msg)
+                    obvious_safe_count += 1
+                else:
+                    needs_ai.append(msg)
+
+            print(f"  Pre-filter:    {obvious_safe_count} obvious safe, {len(needs_ai)} need AI")
+
+            # Process remaining in batches
+            for i in range(0, len(needs_ai), AI_BATCH_SIZE):
+                batch = needs_ai[i:i + AI_BATCH_SIZE]
                 results = classify_with_ollama(batch)
 
                 for msg, is_safe in zip(batch, results):
@@ -370,8 +395,8 @@ def main():
                         quarantined.append(msg)
 
                 # Progress indicator
-                processed = min(i + AI_BATCH_SIZE, len(pass1_safe))
-                print(f"    AI classified: {processed}/{len(pass1_safe)}", end="\r")
+                processed = min(i + AI_BATCH_SIZE, len(needs_ai))
+                print(f"    AI classified: {processed}/{len(needs_ai)}", end="\r")
 
             print(f"  Pass 2 (AI):       {pass2_killed} removed, {len(pass2_safe)} remain")
 
