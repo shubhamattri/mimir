@@ -1,4 +1,6 @@
-.PHONY: up down restart logs status clean-whatsapp clean-linkedin clean-all backup setup migrate
+# Detect bash location (macOS, Linux, fallback)
+SHELL := $(shell command -v bash 2>/dev/null || echo /bin/bash)
+.PHONY: up down restart logs status clean-whatsapp clean-linkedin clean-all backup setup migrate uninstall
 
 # --- Core ---
 up:
@@ -30,10 +32,13 @@ clean-all: clean-whatsapp clean-linkedin
 
 # --- Operations ---
 backup:
-	bash scripts/backup.sh
+	./scripts/backup.sh
 
 setup:
-	bash scripts/setup.sh
+	./scripts/setup.sh
 
 migrate:
-	bash scripts/migrate.sh
+	./scripts/migrate.sh
+
+uninstall:
+	./scripts/uninstall.sh

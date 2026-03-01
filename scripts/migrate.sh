@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+source "$SCRIPT_DIR/detect-os.sh"
+
 # Load .env
 if [ -f .env ]; then
     set -a; source .env; set +a
@@ -21,7 +23,8 @@ fi
 BACKUP_DIR="${1:-}"
 
 if [ -z "$BACKUP_DIR" ]; then
-    echo "Usage: bash scripts/migrate.sh <backup-directory>"
+    echo "Usage: make migrate BACKUP=<backup-directory>"
+    echo "   or: ./scripts/migrate.sh <backup-directory>"
     echo ""
     echo "Available backups:"
     ls -1d "$PROJECT_DIR/backups"/*/ 2>/dev/null || echo "  No backups found in $PROJECT_DIR/backups/"
@@ -35,10 +38,11 @@ fi
 
 echo "=== Mimir Migration ==="
 echo "From backup: $BACKUP_DIR"
-echo "Target: $PROJECT_DIR"
+echo "Target:      $PROJECT_DIR"
+echo "OS:          $MIMIR_OS ($MIMIR_ARCH)"
 echo ""
 
-# --- 1. Ensure Ollama is running and pull models ---
+# --- 1. Ollama models ---
 echo "--- Step 1: Ollama Models ---"
 if [ -f "$BACKUP_DIR/ollama-models.txt" ]; then
     while IFS= read -r model; do
@@ -54,9 +58,8 @@ fi
 # --- 2. Start Open WebUI ---
 echo ""
 echo "--- Step 2: Start Open WebUI ---"
-docker compose up -d
+$MIMIR_COMPOSE up -d
 
-# Wait for container to be ready
 echo "Waiting for Open WebUI container..."
 sleep 5
 
@@ -66,15 +69,14 @@ echo "--- Step 3: Restore Open WebUI Data ---"
 VOLUME_NAME="mimir_open-webui-data"
 
 if [ -f "$BACKUP_DIR/open-webui-data.tar.gz" ]; then
-    # Stop webui to safely restore
-    docker compose stop open-webui
+    $MIMIR_COMPOSE stop open-webui
 
     docker run --rm \
         -v "${VOLUME_NAME}:/data" \
         -v "$BACKUP_DIR:/backup" \
         alpine sh -c "cd /data && tar xzf /backup/open-webui-data.tar.gz"
 
-    docker compose start open-webui
+    $MIMIR_COMPOSE start open-webui
     echo "  Open WebUI data: Restored"
 else
     echo "  No Open WebUI backup found. Fresh install."

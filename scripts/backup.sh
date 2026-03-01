@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+source "$SCRIPT_DIR/detect-os.sh"
+
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_DIR="$PROJECT_DIR/backups/$TIMESTAMP"
 mkdir -p "$BACKUP_DIR"
@@ -77,4 +79,4 @@ echo "=== Backup Complete ==="
 echo "Location: $BACKUP_DIR"
 echo "Size: $BACKUP_SIZE"
 echo ""
-echo "To restore: bash scripts/migrate.sh $BACKUP_DIR"
+echo "To restore: make migrate BACKUP=$BACKUP_DIR"
